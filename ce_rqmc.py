@@ -1,87 +1,114 @@
-"""Cross-entropy randomized quasi-Monte Carlo；仅 run() 启动计算。"""
+"""CE-RQMC：单因子 copula 的正态辅助坐标重要抽样。"""
 import time
+import warnings
 import numpy as np
-from scipy.stats import norm, beta, qmc
+from scipy.stats import norm, qmc
+
+if __package__:
+    from .pmc import PortfolioModel, mean_se, resolve_var_values
+else:
+    from pmc import PortfolioModel, mean_se, resolve_var_values
 
 
-def halton_normals(n, seed, clip):
-    uniforms = qmc.Halton(d=2, scramble=True, seed=seed).random(n)
-    return norm.ppf(uniforms.clip(clip, 1 - clip))
+def log_likelihood_ratio(base, shift):
+    """p(W)/q_mu(W)，p=N(0,I)，q_mu=N(mu,I)。"""
+    return -np.asarray(base) @ shift + 0.5 * np.dot(shift, shift)
 
 
-def simulate_losses(z, config, x_d, rng):
-    shape = (len(z), config.n_obligors)
-    eta_d = rng.standard_normal(shape)
-    eta_l = rng.standard_normal(shape)
-    residual = np.sqrt(1 - config.rho ** 2)
-    x = config.rho * z[:, 1, None] + residual * eta_d
-    y = config.rho * z[:, 0, None] + residual * eta_l
-    uniforms = norm.cdf(y).clip(config.probability_clip, 1 - config.probability_clip)
-    epsilon = beta.ppf(uniforms, config.lgd_alpha, config.lgd_beta)
-    individual = config.exposure * epsilon * (x > x_d)
-    return individual.sum(axis=1), individual
+def proposal_batches(config, model, shift, samples, seed):
+    qmc_seed, noise_seed = np.random.SeedSequence(seed).spawn(2)
+    engine = qmc.Halton(d=model.base_dimension, scramble=True, seed=np.random.default_rng(qmc_seed))
+    rng = np.random.default_rng(noise_seed)
+    for start in range(0, samples, config.batch_size):
+        size = min(config.batch_size, samples - start)
+        uniforms = engine.random(size).clip(config.probability_clip, 1 - config.probability_clip)
+        base = norm.ppf(uniforms) + shift
+        z, scale = model.factors_from_base(base)
+        losses, individual = model.losses_given_factors(z, scale, rng)
+        yield base, losses, individual
 
 
-def ce_pilot_mu(config, threshold, chol, x_d, sigma_inv):
-    rng = np.random.default_rng(config.ce_seed)
-    mu = np.zeros(2)
+def ce_pilot_mu(config, model, target):
+    """逐步提高精英阈值，以带原分布权重的均值更新实现 CE 投影。"""
+    shift = np.zeros(model.base_dimension)
+    history = []
     for iteration in range(config.ce_max_iterations):
-        normals = halton_normals(config.ce_pilot_samples, config.ce_seed + iteration,
-                                 config.probability_clip)
-        z = mu + normals @ chol.T
-        losses, _ = simulate_losses(z, config, x_d, rng)
-        if np.quantile(losses, 1 - config.ce_tail_fraction) > threshold:
+        base = np.empty((config.ce_pilot_samples, model.base_dimension))
+        losses = np.empty(config.ce_pilot_samples)
+        start = 0
+        for w, loss, _ in proposal_batches(config, model, shift, config.ce_pilot_samples,
+                                           config.ce_seed + iteration):
+            stop = start + len(loss)
+            base[start:stop], losses[start:stop] = w, loss
+            start = stop
+        level = min(target, np.quantile(losses, 1 - config.ce_tail_fraction))
+        # Avoid the mass at L=0 making every observation an elite observation.
+        elite = (losses >= level) if level > 0 else (losses > 0)
+        history.append(float(level))
+        if not elite.any():
+            warnings.warn("CE pilot saw no positive losses; using the current valid IS proposal", RuntimeWarning)
             break
-        indicators = losses > threshold
-        if not indicators.any():
-            mu += config.ce_shift_step
+        log_weights = log_likelihood_ratio(base[elite], shift)
+        weights = np.exp(log_weights - log_weights.max())
+        fitted = np.sum(weights[:, None] * base[elite], axis=0) / weights.sum()
+        shift = np.clip((1 - config.ce_smoothing) * shift + config.ce_smoothing * fitted,
+                        -config.ce_max_shift, config.ce_max_shift)
+        if level >= target:
+            break
+    return shift, history
+
+
+def ce_varc_once(config, model, a, shift, seed):
+    numerator = np.zeros(config.n_obligors)
+    denominator, weight_squares = 0.0, 0.0
+    reference = -np.inf
+    hits = 0
+    for base, losses, individual in proposal_batches(config, model, shift, config.ce_samples, seed):
+        mask = np.abs(losses - a) <= config.ce_bandwidth
+        if not mask.any():
             continue
-        log_weights = -(z @ (mu @ sigma_inv)) + 0.5 * (mu @ sigma_inv @ mu)
-        weights = indicators * np.exp(log_weights)
-        if weights.sum() <= 0:
-            mu += config.ce_shift_step
-            continue
-        mu = (weights[:, None] * z).sum(axis=0) / weights.sum()
-    return mu
+        logs = log_likelihood_ratio(base[mask], shift)
+        # Rescale every block to the largest log weight observed so far.
+        new_reference = max(reference, float(logs.max()))
+        factor = np.exp(reference - new_reference)
+        numerator *= factor
+        denominator *= factor
+        weight_squares *= factor * factor
+        weights = np.exp(logs - new_reference)
+        numerator += np.sum(weights[:, None] * individual[mask], axis=0)
+        denominator += weights.sum()
+        weight_squares += np.dot(weights, weights)
+        reference = new_reference
+        hits += int(mask.sum())
+    if hits == 0:
+        return np.full(config.n_obligors, np.nan), 0, 0.0
+    return numerator / denominator, hits, denominator * denominator / weight_squares
 
 
-def ce_varc_once(config, a, mu, seed, chol, x_d, sigma_inv):
-    rng = np.random.default_rng(seed)
-    z = mu + halton_normals(config.ce_samples, seed, config.probability_clip) @ chol.T
-    losses, individual = simulate_losses(z, config, x_d, rng)
-    mask = np.abs(losses - a) <= config.ce_bandwidth
-    if not mask.any():
-        return np.full(config.n_obligors, np.nan)
-    weights = np.exp(-(z @ (mu @ sigma_inv)) + 0.5 * (mu @ sigma_inv @ mu))[mask]
-    return (weights[:, None] * individual[mask]).sum(axis=0) / weights.sum()
-
-
-def run(config):
-    config.validate("ce_rqmc")
-    if __package__:
-        from .pmc import estimate_loss_threshold
-    else:
-        from pmc import estimate_loss_threshold
-    start = time.perf_counter()
-    threshold = (estimate_loss_threshold(config) if config.loss_threshold is None
-                 else config.loss_threshold)
-    covariance = np.array([[1, config.tau], [config.tau, 1]])
-    chol = np.linalg.cholesky(covariance)
-    sigma_inv = np.linalg.inv(covariance)
-    x_d = norm.ppf(1 - np.linspace(config.p_low, config.p_high, config.n_obligors))
-    mu = ce_pilot_mu(config, threshold, chol, x_d, sigma_inv)
-    pilot_time = time.perf_counter() - start
+def run(config, copula):
+    config.validate("ce_rqmc", copula)
+    model = PortfolioModel(config, copula)
+    values, source, calibration_time = resolve_var_values(config, copula, model)
     results = []
-    for alpha, a in zip(config.confidence_levels, config.var_values):
+    for alpha, a in zip(config.confidence_levels, values):
         start = time.perf_counter()
-        values = np.asarray([
-            ce_varc_once(config, a, mu, config.ce_seed + config.ce_replication_seed_offset + r,
-                         chol, x_d, sigma_inv)
-            for r in range(config.repetitions)
-        ])
-        se = (values.std(axis=0, ddof=1) / np.sqrt(config.repetitions)
-              if config.repetitions > 1 else np.zeros(config.n_obligors))
-        results.append({"alpha": alpha, "a": a, "mean_VaRC": values.mean(axis=0),
-                        "se_VaRC": se, "mu_star": mu.copy(), "loss_threshold": threshold,
-                        "pilot_time": pilot_time, "total_time": time.perf_counter() - start})
+        target = max(0.0, a - config.ce_bandwidth)
+        shift, history = ce_pilot_mu(config, model, target)
+        pilot_time = time.perf_counter() - start
+        estimates, hits, ess = [], [], []
+        for r in range(config.repetitions):
+            estimate, count, effective = ce_varc_once(
+                config, model, a, shift, config.ce_seed + config.ce_replication_seed_offset + r)
+            estimates.append(estimate)
+            hits.append(count)
+            ess.append(effective)
+        if min(hits) == 0:
+            warnings.warn("Some CE replications have no samples in the VaR band; returning NaN", RuntimeWarning)
+        mean, se = mean_se(estimates)
+        results.append({"alpha": alpha, "a": a, "mean_VaRC": mean, "se_VaRC": se,
+                        "copula": copula, "mu_star": shift, "loss_threshold": target,
+                        "pilot_thresholds": history, "pilot_time": pilot_time,
+                        "samples": np.mean(hits), "band_ess": np.mean(ess),
+                        "var_source": source, "var_calibration_time": calibration_time,
+                        "total_time": time.perf_counter() - start, "time_scope": "this_level"})
     return results

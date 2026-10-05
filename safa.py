@@ -1,79 +1,62 @@
-"""SAFA；保留原估计公式，同质 LGD 载荷由 config.rho 指定。"""
+"""SAFA：将经验 CDF 的分部积分精确化简后，对自身 LGD 解析积分。
+
+A_i(a) = E[p_i(Z,S) e_i* f(e_i*|Z,S) 1{0<e_i*<1}],
+e_i*=(a-L_{-i})/u_i。VaRC_i = a A_i / sum_j A_j。
+这包含 L_{-i}=0 的概率质量，不再减去该质量对应的贡献。
+"""
 import time
+import warnings
 import numpy as np
-from scipy.stats import norm, beta
+
+if __package__:
+    from .pmc import PortfolioModel, mean_se, resolve_var_values
+else:
+    from pmc import PortfolioModel, mean_se, resolve_var_values
 
 
-def conditional_density(epsilon, z_l, config):
-    epsilon = np.clip(epsilon, config.probability_clip, 1 - config.probability_clip)
-    v = norm.ppf(beta.cdf(epsilon, config.lgd_alpha, config.lgd_beta))
-    s = np.sqrt(1 - config.rho ** 2)
-    w = (v - config.rho * z_l) / s
-    phi_v = norm.pdf(v)
-    if phi_v <= 0:
-        return 0.0
-    return beta.pdf(epsilon, config.lgd_alpha, config.lgd_beta) * norm.pdf(w) / (phi_v * s)
+def conditional_numerators(model, a, losses, z, scale):
+    """每条条件路径的 A_i 样本；支持非单位 EAD，并处理零损失原子。"""
+    remaining = losses.sum(axis=1, keepdims=True) - losses
+    # All losses are nonnegative; eliminate tiny subtraction roundoff.
+    remaining = np.maximum(remaining, 0.0)
+    epsilon = (a - remaining) / model.config.exposure
+    valid = (epsilon > 0) & (epsilon < 1)
+    log_density = model.conditional_lgd_logpdf(epsilon, z, scale)
+    value = np.zeros_like(epsilon)
+    value[valid] = np.exp(np.log(epsilon[valid]) + log_density[valid])
+    return value * model.conditional_default_probabilities(z, scale)
 
 
-def run(config):
-    config.validate("safa")
+def run(config, copula):
+    config.validate("safa", copula)
+    model = PortfolioModel(config, copula)
+    values, source, calibration_time = resolve_var_values(config, copula, model)
     rng = np.random.default_rng(config.seed)
-    n, inner = config.n_obligors, config.safa_inner
-    rho, u = config.rho, np.full(n, config.exposure)
-    s = np.sqrt(1 - rho ** 2)
-    lgd_a, lgd_b = config.lgd_alpha, config.lgd_beta
-    covariance = [[1, config.tau], [config.tau, 1]]
-    x_d = norm.ppf(1 - np.linspace(config.p_low, config.p_high, n))
     results = []
-    for alpha, a in zip(config.confidence_levels, config.var_values):
+    for alpha, a in zip(config.confidence_levels, values):
         start = time.perf_counter()
-        contributions = []
+        contributions, densities = [], []
         for _ in range(config.repetitions):
-            accumulated = np.zeros(n)
-            for _ in range(config.safa_outer):
-                z_l, z_d = rng.multivariate_normal([0, 0], covariance)
-                eta_l = rng.standard_normal((n, inner))
-                eta_d = rng.standard_normal((n, inner))
-                epsilon_all = beta.ppf(norm.cdf(rho * z_l + s * eta_l), lgd_a, lgd_b)
-                defaults = (rho * z_d + s * eta_d) > x_d[:, None]
-                losses = u[:, None] * epsilon_all * defaults
-                sorted_minus = np.sort(losses.sum(axis=0)[None, :] - losses, axis=1)
-
-                # 同质载荷允许各 obligor 共享条件 LGD 样本。
-                epsilon = np.clip(beta.ppf(norm.cdf(rho * z_l + s * rng.standard_normal(inner)),
-                                           lgd_a, lgd_b), config.safa_epsilon_clip,
-                                  1 - config.safa_epsilon_clip)
-                f_beta = beta.pdf(epsilon, lgd_a, lgd_b)
-                v = norm.ppf(beta.cdf(epsilon, lgd_a, lgd_b))
-                w = (v - rho * z_l) / s
-                phi_v, phi_w = norm.pdf(v), norm.pdf(w)
-                mask = phi_v > 0
-                f_cond, term1 = np.zeros(inner), np.zeros(inner)
-                f_cond[mask] = f_beta[mask] * phi_w[mask] / (phi_v[mask] * s)
-                term1[mask] = f_beta[mask] / phi_v[mask] * (v[mask] - w[mask] / s)
-                term2 = (lgd_a - 1) / epsilon - (lgd_b - 1) / (1 - epsilon)
-                f_prime = f_cond * (term1 + term2)
-                g = np.zeros(inner)
-                valid = f_cond > 0
-                g[valid] = 1 + epsilon[valid] * f_prime[valid] / f_cond[valid]
-                p_cond = 1 - norm.cdf((x_d - rho * z_d) / s)
-                prod_all = np.prod(1 - p_cond)
-                inner_values = np.zeros(n)
-                for i in range(n):
-                    boundary = 0.0
-                    if 0 < a / u[i] < 1:
-                        denominator = 1 - p_cond[i]
-                        prod_i = prod_all / denominator if denominator > 0 else 0.0
-                        boundary = -a / u[i] * conditional_density(a / u[i], z_l, config) * prod_i
-                    thresholds = a - u[i] * epsilon
-                    cdf = np.searchsorted(sorted_minus[i], thresholds, side="right") / inner
-                    inner_values[i] = np.sum(cdf * g) / inner + boundary
-                accumulated += p_cond * inner_values
+            accumulated = np.zeros(config.n_obligors)
+            zs, scales = model.sample_factors(rng, config.safa_outer)
+            for z, scale in zip(zs, scales):
+                inner_sum = np.zeros(config.n_obligors)
+                for offset in range(0, config.safa_inner, config.batch_size):
+                    size = min(config.batch_size, config.safa_inner - offset)
+                    _, losses = model.losses_given_factors(np.full(size, z), np.full(size, scale), rng)
+                    inner_sum += conditional_numerators(model, a, losses, z, scale).sum(axis=0)
+                accumulated += inner_sum / config.safa_inner
             accumulated /= config.safa_outer
             density = accumulated.sum() / a
-            contributions.append(accumulated / density if density != 0 else np.zeros(n))
-        results.append({"alpha": alpha, "a": a,
-                        "mean_VaRC": np.mean(contributions, axis=0),
-                        "se_VaRC": np.std(contributions, axis=0) / np.sqrt(config.repetitions),
-                        "total_time": time.perf_counter() - start})
+            densities.append(density)
+            if not np.isfinite(density) or density <= 0:
+                warnings.warn("SAFA estimated no positive finite density at VaR; returning NaN", RuntimeWarning)
+                contributions.append(np.full(config.n_obligors, np.nan))
+            else:
+                contributions.append(accumulated / density)
+        mean, se = mean_se(contributions)
+        results.append({"alpha": alpha, "a": a, "mean_VaRC": mean, "se_VaRC": se,
+                        "copula": copula, "density": np.mean(densities),
+                        "var_source": source, "var_calibration_time": calibration_time,
+                        "total_time": time.perf_counter() - start, "time_scope": "this_level"})
     return results
